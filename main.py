@@ -423,52 +423,52 @@ def on_candle_update(msg):
         if not data: 
             logging.warning("Received empty data in websocket message")
             return
-    
-    # Data format from WS: {'t': 1733837400000, 'T': 1733837699999, 's': 'BTC', 'i': '5m', 'o': 98000.0, 'c': 98100.0, 'h': 98200.0, 'l': 97900.0, 'v': 100.0, 'n': 10}
-    # We rely on 't' (start time) to detect new candle
-    
-    new_t = data['t']
-    close_price = float(data['c'])
-    open_price = float(data['o'])
-    high_price = float(data['h'])
-    low_price = float(data['l'])
-    volume = float(data['v'])
-    
-    # If this is the first message or a continuation of the same candle
-    if latest_candle_cache is None:
-        latest_candle_cache = data
-        return
+        
+        # Data format from WS: {'t': 1733837400000, 'T': 1733837699999, 's': 'BTC', 'i': '5m', 'o': 98000.0, 'c': 98100.0, 'h': 98200.0, 'l': 97900.0, 'v': 100.0, 'n': 10}
+        # We rely on 't' (start time) to detect new candle
+        
+        new_t = data['t']
+        close_price = float(data['c'])
+        open_price = float(data['o'])
+        high_price = float(data['h'])
+        low_price = float(data['l'])
+        volume = float(data['v'])
+        
+        # If this is the first message or a continuation of the same candle
+        if latest_candle_cache is None:
+            latest_candle_cache = data
+            return
 
-    last_t = latest_candle_cache['t']
-    
-    if new_t > last_t:
-        # The previous candle (last_t) is now closed.
-        # We must finalize it and add it to df_history
-        final_candle = latest_candle_cache
-        ts = pd.to_datetime(final_candle['t'], unit='ms')
+        last_t = latest_candle_cache['t']
         
-        # Adding to DataFrame
-        row = pd.DataFrame([{
-            'open': float(final_candle['o']),
-            'high': float(final_candle['h']),
-            'low': float(final_candle['l']),
-            'close': float(final_candle['c']),
-            'volume': float(final_candle['v'])
-        }], index=[ts])
-        
-        df_history = pd.concat([df_history, row])
-        # Ensure we don't grow infinitely, keep last 1000
-        if len(df_history) > 1000:
-            df_history = df_history.iloc[-1000:]
+        if new_t > last_t:
+            # The previous candle (last_t) is now closed.
+            # We must finalize it and add it to df_history
+            final_candle = latest_candle_cache
+            ts = pd.to_datetime(final_candle['t'], unit='ms')
             
-        print(f"--- Candle Closed: {ts} | Close: {final_candle['c']} ---")
-        update_strategy(df_history)
+            # Adding to DataFrame
+            row = pd.DataFrame([{
+                'open': float(final_candle['o']),
+                'high': float(final_candle['h']),
+                'low': float(final_candle['l']),
+                'close': float(final_candle['c']),
+                'volume': float(final_candle['v'])
+            }], index=[ts])
+            
+            df_history = pd.concat([df_history, row])
+            # Ensure we don't grow infinitely, keep last 1000
+            if len(df_history) > 1000:
+                df_history = df_history.iloc[-1000:]
+                
+            print(f"--- Candle Closed: {ts} | Close: {final_candle['c']} ---")
+            update_strategy(df_history)
+            
+            latest_candle_cache = data
+        else:
+            # Same candle updating
+            latest_candle_cache = data
         
-        latest_candle_cache = data
-    else:
-        # Same candle updating
-        latest_candle_cache = data
-    
     except Exception as e:
         logging.error(f"Error in on_candle_update: {str(e)}", exc_info=True)
 
