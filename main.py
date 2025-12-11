@@ -7,7 +7,17 @@ import datetime
 import time
 import sys
 import threading
-import traceback
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot_errors.log'),
+        logging.StreamHandler()
+    ]
+)
 
 # --- Configuration ---
 SYMBOL = "BTC" 
@@ -38,9 +48,6 @@ TP_SIZES_UI = [0.25, 0.25, 0.25, 0.25]
 SR_STRENGTH = 2
 SR_ZONE_WIDTH = 2
 SR_PIVOT_RANGE = 15
-
-# --- Global Variables ---
-last_ws_update = time.time()  # Track last WebSocket message
 
 # --- Indicator Functions (Copied from backtest_btc.py) ---
 
@@ -409,211 +416,151 @@ def update_strategy(closed_df):
     print(f"[{timestamp}] P: {price:.2f} | Sig: {signal} | Valid: {is_valid if signal != 'HOLD' else '-'} | SRs: {len(active_resistances)+len(active_supports)}")
 
 def on_candle_update(msg):
-    global df_history, latest_candle_cache, last_ws_update
+    global df_history, latest_candle_cache
     
     try:
-        # Update last message timestamp
-        last_ws_update = time.time()
-        
         data = msg.get('data', {})
         if not data: 
-            print(f"\n[WARNING] Empty data in WebSocket message: {msg}")
+            logging.warning("Received empty data in websocket message")
             return
-        
-        # Data format from WS: {'t': 1733837400000, 'T': 1733837699999, 's': 'BTC', 'i': '5m', 'o': 98000.0, 'c': 98100.0, 'h': 98200.0, 'l': 97900.0, 'v': 100.0, 'n': 10}
-        # We rely on 't' (start time) to detect new candle
-        
-        new_t = data['t']
-        close_price = float(data['c'])
-        open_price = float(data['o'])
-        high_price = float(data['h'])
-        low_price = float(data['l'])
-        volume = float(data['v'])
-        
-        # If this is the first message or a continuation of the same candle
-        if latest_candle_cache is None:
-            latest_candle_cache = data
-            print(f"\n[INFO] First candle received: {pd.to_datetime(new_t, unit='ms')}")
-            return
+    
+    # Data format from WS: {'t': 1733837400000, 'T': 1733837699999, 's': 'BTC', 'i': '5m', 'o': 98000.0, 'c': 98100.0, 'h': 98200.0, 'l': 97900.0, 'v': 100.0, 'n': 10}
+    # We rely on 't' (start time) to detect new candle
+    
+    new_t = data['t']
+    close_price = float(data['c'])
+    open_price = float(data['o'])
+    high_price = float(data['h'])
+    low_price = float(data['l'])
+    volume = float(data['v'])
+    
+    # If this is the first message or a continuation of the same candle
+    if latest_candle_cache is None:
+        latest_candle_cache = data
+        return
 
-        last_t = latest_candle_cache['t']
+    last_t = latest_candle_cache['t']
+    
+    if new_t > last_t:
+        # The previous candle (last_t) is now closed.
+        # We must finalize it and add it to df_history
+        final_candle = latest_candle_cache
+        ts = pd.to_datetime(final_candle['t'], unit='ms')
         
-        if new_t > last_t:
-            # The previous candle (last_t) is now closed.
-            # We must finalize it and add it to df_history
-            final_candle = latest_candle_cache
-            ts = pd.to_datetime(final_candle['t'], unit='ms')
+        # Adding to DataFrame
+        row = pd.DataFrame([{
+            'open': float(final_candle['o']),
+            'high': float(final_candle['h']),
+            'low': float(final_candle['l']),
+            'close': float(final_candle['c']),
+            'volume': float(final_candle['v'])
+        }], index=[ts])
+        
+        df_history = pd.concat([df_history, row])
+        # Ensure we don't grow infinitely, keep last 1000
+        if len(df_history) > 1000:
+            df_history = df_history.iloc[-1000:]
             
-            # Adding to DataFrame
-            row = pd.DataFrame([{
-                'open': float(final_candle['o']),
-                'high': float(final_candle['h']),
-                'low': float(final_candle['l']),
-                'close': float(final_candle['c']),
-                'volume': float(final_candle['v'])
-            }], index=[ts])
-            
-            df_history = pd.concat([df_history, row])
-            # Ensure we don't grow infinitely, keep last 1000
-            if len(df_history) > 1000:
-                df_history = df_history.iloc[-1000:]
-                
-            print(f"\n--- Candle Closed: {ts} | Close: {final_candle['c']} ---")
-            update_strategy(df_history)
-            
-            latest_candle_cache = data
-        else:
-            # Same candle updating
-            latest_candle_cache = data
+        print(f"--- Candle Closed: {ts} | Close: {final_candle['c']} ---")
+        update_strategy(df_history)
+        
+        latest_candle_cache = data
+    else:
+        # Same candle updating
+        latest_candle_cache = data
+    
     except Exception as e:
-        print(f"\n[ERROR] in on_candle_update: {e}")
-        print(traceback.format_exc())
+        logging.error(f"Error in on_candle_update: {str(e)}", exc_info=True)
 
 def main():
-    global df_history, last_ws_update
+    global df_history
     
     print("Initializing Live BTC Scalper...")
-    reconnect_count = 0
+    logging.info("Starting Live BTC Scalper")
     
-    while True:  # Reconnection loop
+    try:
+        info = Info(constants.MAINNET_API_URL, skip_ws=False)
+    except Exception as e:
+        logging.error(f"Failed to initialize Info object: {str(e)}", exc_info=True)
+        print(f"ERROR: Failed to connect to Hyperliquid API: {e}")
+        return
+    
+    # 1. Fetch History
+    print("Fetching initial history...")
+    try:
+        end_time = int(datetime.datetime.now().timestamp() * 1000)
+        start_time = end_time - (1000 * 60 * 5 * 500) # 500 candles
+        candles = info.candles_snapshot(name=SYMBOL, interval=TIMEFRAME, startTime=start_time, endTime=end_time)
+    except Exception as e:
+        logging.error(f"Failed to fetch initial history: {str(e)}", exc_info=True)
+        print(f"ERROR: Failed to fetch candle history: {e}")
+        return
+    
+    df = pd.DataFrame(candles)
+    if not df.empty:
+        for col in ['o', 'h', 'l', 'c', 'v']:
+            df[col] = pd.to_numeric(df[col])
+        df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df.sort_index(inplace=True)
+        df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+        df_history = df
+        print(f"Loaded {len(df)} candles.")
+        # Run initial strategy to populate supports/resistances
+        update_strategy(df_history)
+    else:
+        print("Warning: No history found.")
+    
+    # 2. Subscribe
+    print(f"Subscribing to {SYMBOL} {TIMEFRAME} candles...")
+    try:
+        subscription = {"type": "candle", "coin": SYMBOL, "interval": TIMEFRAME}
+        info.subscribe(subscription, on_candle_update)
+        logging.info(f"Successfully subscribed to {SYMBOL} {TIMEFRAME} websocket")
+    except Exception as e:
+        logging.error(f"Failed to subscribe to websocket: {str(e)}", exc_info=True)
+        print(f"ERROR: Failed to subscribe to websocket: {e}")
+        return
+    
+    print("Listening for updates... (Press Ctrl+C to stop)")
+    last_heartbeat = time.time()
+    last_update_time = time.time()
+    
+    while True:
         try:
-            if reconnect_count > 0:
-                print(f"\n[INFO] Reconnection attempt #{reconnect_count}")
+            time.sleep(1)
+            
+            # Check for websocket disconnection (no updates for 60 seconds)
+            if latest_candle_cache and time.time() - last_update_time > 60:
+                logging.warning("No websocket updates received for 60 seconds - possible disconnection")
+                print("\nWARNING: Websocket may be disconnected - no updates received")
+                last_update_time = time.time()
+            
+            # Optional: Print ticker price occasionally
+            if latest_candle_cache:
+                last_update_time = time.time()
+                t_ms = latest_candle_cache['t']
+                dt_obj = datetime.datetime.fromtimestamp(t_ms/1000)
+                next_close = dt_obj + datetime.timedelta(minutes=5)
+                time_str = datetime.datetime.now().strftime('%H:%M:%S')
                 
-            info = Info(constants.MAINNET_API_URL, skip_ws=False)
-            
-            # 1. Fetch History
-            print("Fetching initial history...")
-            end_time = int(datetime.datetime.now().timestamp() * 1000)
-            start_time = end_time - (1000 * 60 * 5 * 500) # 500 candles
-            
-            try:
-                candles = info.candles_snapshot(name=SYMBOL, interval=TIMEFRAME, startTime=start_time, endTime=end_time)
-            except Exception as fetch_error:
-                error_msg = str(fetch_error).lower()
-                if 'rate limit' in error_msg or '429' in error_msg:
-                    print(f"\n[ERROR] RATE LIMIT HIT: {fetch_error}")
-                    print("Waiting 60 seconds before retrying...")
-                    time.sleep(60)
-                    reconnect_count += 1
-                    continue
-                elif 'connection' in error_msg or 'timeout' in error_msg or 'network' in error_msg:
-                    print(f"\n[ERROR] CONNECTION FAILED: {fetch_error}")
-                    print("Retrying in 10 seconds...")
-                    time.sleep(10)
-                    reconnect_count += 1
-                    continue
-                else:
-                    print(f"\n[ERROR] Failed to fetch candles: {fetch_error}")
-                    raise
-            
-            df = pd.DataFrame(candles)
-            if not df.empty:
-                for col in ['o', 'h', 'l', 'c', 'v']:
-                    df[col] = pd.to_numeric(df[col])
-                df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                df.sort_index(inplace=True)
-                df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-                df_history = df
-                print(f"✓ Loaded {len(df)} candles. Latest: {df.index[-1]}")
-                # Run initial strategy to populate supports/resistances
-                update_strategy(df_history)
-            else:
-                print("[WARNING] No history found, continuing anyway...")
-            
-            # 2. Subscribe
-            print(f"Subscribing to {SYMBOL} {TIMEFRAME} candles...")
-            subscription = {"type": "candle", "coin": SYMBOL, "interval": TIMEFRAME}
-            
-            try:
-                info.subscribe(subscription, on_candle_update)
-                print("✓ WebSocket subscription successful")
-                reconnect_count = 0  # Reset on successful connection
-            except Exception as sub_error:
-                error_msg = str(sub_error).lower()
-                if 'rate limit' in error_msg or '429' in error_msg:
-                    print(f"\n[ERROR] RATE LIMIT on WebSocket subscription: {sub_error}")
-                    print("Waiting 60 seconds before retrying...")
-                    time.sleep(60)
-                    reconnect_count += 1
-                    continue
-                elif 'connection' in error_msg or 'refused' in error_msg:
-                    print(f"\n[ERROR] WebSocket CONNECTION REFUSED: {sub_error}")
-                    print("Retrying in 10 seconds...")
-                    time.sleep(10)
-                    reconnect_count += 1
-                    continue
-                else:
-                    print(f"\n[ERROR] WebSocket subscription failed: {sub_error}")
-                    raise
-            
-            # Initialize last update time
-            last_ws_update = time.time()
-            
-            print("Listening for updates... (Press Ctrl+C to stop)")
-            last_heartbeat = time.time()
-            ws_timeout_seconds = 90  # If no WS update in 90s, reconnect
-            
-            while True:
-                try:
-                    time.sleep(1)
-                    
-                    # Check for WebSocket timeout
-                    time_since_update = time.time() - last_ws_update
-                    if time_since_update > ws_timeout_seconds:
-                        print(f"\n[ERROR] WebSocket TIMEOUT - No updates for {time_since_update:.0f}s")
-                        print("[INFO] Initiating reconnection...")
-                        reconnect_count += 1
-                        break  # Break inner loop to trigger reconnection
-                    
-                    # Optional: Print ticker price occasionally
-                    if latest_candle_cache:
-                        t_ms = latest_candle_cache['t']
-                        dt_obj = datetime.datetime.fromtimestamp(t_ms/1000)
-                        next_close = dt_obj + datetime.timedelta(minutes=5)
-                        time_str = datetime.datetime.now().strftime('%H:%M:%S')
-                        
-                        # Ticker (Updates same line)
-                        sys.stdout.write(f"\r[{time_str}] Price: {latest_candle_cache['c']} | Next close: {next_close.strftime('%H:%M')} | WS: {time_since_update:.0f}s ago     ")
-                        sys.stdout.flush()
-                        
-                        # Heartbeat (New line every 60s)
-                        if time.time() - last_heartbeat > 60:
-                            sys.stdout.write(f"\n[{time_str}] ✓ STATUS OK | Price: {latest_candle_cache['c']} | Active Trade: {'YES' if current_trade and current_trade.active else 'NO'}\n")
-                            last_heartbeat = time.time()
-                except KeyboardInterrupt:
-                    print("\n[INFO] Shutdown requested by user")
-                    return  # Exit completely
+                # Ticker (Updates same line)
+                sys.stdout.write(f"\r[{time_str}] Price: {latest_candle_cache['c']} | Waiting for candle close at {next_close.strftime('%H:%M')}...     ")
+                sys.stdout.flush()
+                
+                # Heartbeat (New line every 60s)
+                if time.time() - last_heartbeat > 60:
+                    sys.stdout.write(f"\n[{time_str}] STATUS OK | Price: {latest_candle_cache['c']} | Active Trade: {'YES' if current_trade and current_trade.active else 'NO'}\n")
+                    last_heartbeat = time.time()
                     
         except KeyboardInterrupt:
-            print("\n[INFO] Shutdown requested by user")
-            break  # Exit reconnection loop
-        except ConnectionError as conn_err:
-            print(f"\n[ERROR] CONNECTION ERROR: {conn_err}")
-            print(f"Reconnecting in 10 seconds... (Attempt #{reconnect_count + 1})")
-            time.sleep(10)
-            reconnect_count += 1
+            logging.info("Bot stopped by user")
+            print("\nExiting...")
+            break
         except Exception as e:
-            error_msg = str(e).lower()
-            if 'rate limit' in error_msg or '429' in error_msg:
-                print(f"\n[ERROR] RATE LIMIT EXCEEDED: {e}")
-                print("Waiting 60 seconds before retrying...")
-                time.sleep(60)
-            elif 'permission' in error_msg or 'forbidden' in error_msg or '403' in error_msg:
-                print(f"\n[ERROR] PERMISSION DENIED: {e}")
-                print("Check API access and keys. Waiting 30 seconds...")
-                time.sleep(30)
-            elif 'timeout' in error_msg or 'timed out' in error_msg:
-                print(f"\n[ERROR] REQUEST TIMEOUT: {e}")
-                print("Retrying in 5 seconds...")
-                time.sleep(5)
-            else:
-                print(f"\n[ERROR] Unexpected error: {e}")
-                print(traceback.format_exc())
-                print("Reconnecting in 10 seconds...")
-                time.sleep(10)
-            reconnect_count += 1
+            logging.error(f"Error in main loop: {str(e)}", exc_info=True)
+            print(f"\nERROR in main loop: {e}")
+            time.sleep(5)  # Wait before continuing
 
 if __name__ == "__main__":
     main()
