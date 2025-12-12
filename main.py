@@ -11,7 +11,6 @@ import threading
 # --- Configuration ---
 SYMBOL = "BTC" 
 TIMEFRAME = "5m"
-# Dummy capital for simulation logging
 INITIAL_CAPITAL = 200.0
 LEVERAGE = 40
 
@@ -339,6 +338,8 @@ active_resistances = []
 active_supports = []
 MAX_SR = 5
 latest_candle_cache = None
+last_ws_update_time = 0
+
 
 def update_strategy(closed_df):
     global current_trade, active_resistances, active_supports
@@ -405,7 +406,9 @@ def update_strategy(closed_df):
     print(f"[{timestamp}] P: {price:.2f} | Sig: {signal} | Valid: {is_valid if signal != 'HOLD' else '-'} | SRs: {len(active_resistances)+len(active_supports)}")
 
 def on_candle_update(msg):
-    global df_history, latest_candle_cache
+    global df_history, latest_candle_cache, last_ws_update_time
+    last_ws_update_time = time.time()
+
     
     data = msg.get('data', {})
     if not data: return
@@ -456,42 +459,61 @@ def on_candle_update(msg):
         latest_candle_cache = data
 
 def main():
-    global df_history
+    global df_history, last_ws_update_time
     
     print("Initializing Live BTC Scalper...")
-    info = Info(constants.MAINNET_API_URL, skip_ws=False)
     
-    # 1. Fetch History
-    print("Fetching initial history...")
-    end_time = int(datetime.datetime.now().timestamp() * 1000)
-    start_time = end_time - (1000 * 60 * 5 * 500) # 500 candles
-    candles = info.candles_snapshot(name=SYMBOL, interval=TIMEFRAME, startTime=start_time, endTime=end_time)
-    
-    df = pd.DataFrame(candles)
-    if not df.empty:
-        for col in ['o', 'h', 'l', 'c', 'v']:
-            df[col] = pd.to_numeric(df[col])
-        df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df.sort_index(inplace=True)
-        df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-        df_history = df
-        print(f"Loaded {len(df)} candles.")
-        # Run initial strategy to populate supports/resistances
-        update_strategy(df_history)
-    else:
-        print("Warning: No history found.")
-    
-    # 2. Subscribe
-    print(f"Subscribing to {SYMBOL} {TIMEFRAME} candles...")
-    subscription = {"type": "candle", "coin": SYMBOL, "interval": TIMEFRAME}
-    info.subscribe(subscription, on_candle_update)
-    
+    def connect_ws():
+        try:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Connecting to Hyperliquid...")
+            info = Info(constants.MAINNET_API_URL, skip_ws=False)
+
+            # 1. Fetch History
+            print("Fetching initial history...")
+            end_time = int(datetime.datetime.now().timestamp() * 1000)
+            start_time = end_time - (1000 * 60 * 5 * 500) # 500 candles
+            candles = info.candles_snapshot(name=SYMBOL, interval=TIMEFRAME, startTime=start_time, endTime=end_time)
+
+            df = pd.DataFrame(candles)
+            if not df.empty:
+                for col in ['o', 'h', 'l', 'c', 'v']:
+                    df[col] = pd.to_numeric(df[col])
+                df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                df.sort_index(inplace=True)
+                df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+                df_history = df
+                print(f"Loaded {len(df)} candles.")
+                # Run initial strategy to populate supports/resistances
+                update_strategy(df_history)
+            else:
+                print("Warning: No history found.")
+
+            # 2. Subscribe
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Subscribing to {SYMBOL} {TIMEFRAME} candles...")
+            subscription = {"type": "candle", "coin": SYMBOL, "interval": TIMEFRAME}
+            info.subscribe(subscription, on_candle_update)
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] WebSocket Connected.")
+            return info
+        except Exception as e:
+            print(f"Error connecting: {e}")
+            return None
+
+    info = connect_ws()
+    last_ws_update_time = time.time()
+
     print("Listening for updates... (Press Ctrl+C to stop)")
     last_heartbeat = time.time()
     while True:
         try:
             time.sleep(1)
+            
+            # Check Connection
+            if time.time() - last_ws_update_time > 20: # 20s timeout
+                print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] WebSocket Disconnected (No updates for 20s). Reconnecting...")
+                info = connect_ws()
+                last_ws_update_time = time.time()
+            
             # Optional: Print ticker price occasionally
             if latest_candle_cache:
                 t_ms = latest_candle_cache['t']
